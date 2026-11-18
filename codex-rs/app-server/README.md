@@ -37,6 +37,23 @@ across account switches. Resume and revert preserve that distinction; forks are 
 Scoped requests skip candidates whose rollout header cannot be read. API-key
 logins see all local history. Direct access by thread ID remains available.
 
+# Streaming thread search (experimental)
+
+`thread/search` continues to return a single paginated response. Clients that initialize
+with `experimentalApi: true` can instead call `thread/search/stream` with the same params
+(a maximum of 65,536 UTF-8 bytes for the trimmed search term).
+It emits best-effort `thread/search/partial` notifications containing the original
+`requestId` and a small subset of verified results. Partials may be dropped, may fall
+outside the final page, and use stored thread metadata; replace them with the final
+response, which is authoritative for results, ordering, and cursors.
+
+Send `thread/search/stream/cancel` with `{requestId}` on the same connection to cancel
+the original streaming request. A client can use a UUID string as the search request ID. The cancel RPC has its own ID and returns `{}`; the
+search completes independently with an error if cancellation wins, or may succeed if
+completion races cancellation. Unknown or finished IDs are no-ops. `thread/search/cancel`
+targets only the existing nonstreaming method. A JavaScript client can connect an
+`AbortSignal` listener to the corresponding cancel RPC.
+
 # Thread list ID filters
 
 `thread/list` accepts `includedThreadIds` to list specific saved threads and
@@ -111,12 +128,12 @@ exact revision match, and both conflicts return `-32600` with
 Do not blindly retry: the original action may precede an unseen result or
 another window's mark. Unavailable threads fail; writes never change recency.
 
-Started, resumed or forked threads send `thread/readState/changed` alongside
-ordinary thread events; thread/unsubscribe or disconnect stops delivery.
-Clients can filter this method with the existing notification opt-out setting.
+The server broadcasts `thread/readState/changed` to initialized experimental clients
+whenever a durable receipt changes, including for chats they have not opened. Clients can
+ignore irrelevant thread IDs or suppress the method with `optOutNotificationMethods`.
 Revisions are equality tokens, not clocks: never compare or merge them across
 threads or hosts. When concurrent responses disagree, refresh with `thread/read`.
-Offscreen threads converge on page refresh.
+Refresh the list after reconnecting to recover changes missed while disconnected.
 
 # Guardian circuit-breaker errors
 
@@ -964,6 +981,28 @@ managed fields. Configuration writes that overlap managed settings are rejected.
 
 Exporter header values are redacted in effective config, source layers, managed
 requirements, and write-override metadata. Runtime exporters retain the original values.
+
+A system `requirements.toml` file or MDM requirements payload can set
+`otel.headers_helper` and its optional `otel.headers_helper_refresh_interval_ms`.
+Put the helper and each OTLP HTTP exporter that should receive its headers in
+the same requirements layer. If another layer replaces an exporter, that
+exporter uses its own configured headers.
+
+Set the managed helper to the absolute path of an executable, for example
+`/opt/company/bin/otel-auth`. Install it in a directory controlled by the
+administrator and grant Codex users permission to execute it. Codex launches
+the executable directly with its parent as the working directory. A relative
+path makes the managed requirements invalid. If the executable is missing or
+cannot run, Codex warns and pauses exports that depend on its headers until a
+refresh succeeds.
+
+**Rollout.** Install the helper and upgrade targeted clients to a release that
+supports both keys in managed requirements before enabling either key in policy.
+Older clients can reject the requirements at startup even if they support the
+helper in ordinary config. For a mixed fleet, target only upgraded devices.
+
+**Rollback.** Remove both managed keys and confirm each device has received the
+updated policy before downgrading its client or uninstalling the helper.
 
 Managed span attributes and tracestate metadata are included in effective config
 and requirements reads. Unmanaged metadata remains writable.

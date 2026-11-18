@@ -22,7 +22,9 @@
 
 mod cloud;
 pub mod cloud_backend;
+pub use codex_cloud_client::EnvironmentSelection;
 pub use codex_cloud_client::ProjectEnvironment;
+pub use codex_cloud_client::SavedEnvironment;
 mod path;
 mod remote;
 mod remote_addr;
@@ -408,13 +410,15 @@ impl InProcessAppServerClient {
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 tokio::spawn(async move {
-                                    // Device ceremonies belong to the waiting UI. Preserve
-                                    // its cancellation through this buffering task.
+                                    // Dropping the UI's request must drop the detached runtime
+                                    // future too: its drop guard cancels verification and search.
                                     let cancellable = matches!(*request,
                                         ClientRequest::UserVerificationStatus { .. }
                                         | ClientRequest::UserVerificationEnroll { .. }
                                         | ClientRequest::UserVerificationDelete { .. }
-                                        | ClientRequest::UserVerificationVerify { .. });
+                                        | ClientRequest::UserVerificationVerify { .. }
+                                        | ClientRequest::ThreadSearch { .. }
+                                        | ClientRequest::ThreadSearchStream { .. });
                                     let mut response_tx = response_tx;
                                     tokio::select! {
                                         _ = response_tx.closed(), if cancellable => {}
@@ -725,22 +729,22 @@ impl InProcessAppServerRequestHandle {
 }
 
 impl AppServerRequestHandle {
-    /// Starts a native cloud thread with host project metadata without adding wire fields.
-    pub async fn start_cloud_project_thread(
+    /// Starts a native Cloud thread with a saved config or a default project checkout.
+    pub async fn start_cloud_thread_with_environment(
         &self,
         request_id: RequestId,
         params: codex_app_server_protocol::ThreadStartParams,
-        project: codex_cloud_client::ProjectEnvironment,
+        environment: codex_cloud_client::EnvironmentSelection,
     ) -> Result<codex_app_server_protocol::ThreadStartResponse, TypedRequestError> {
         let response = match self {
             Self::Cloud(handle) => {
                 handle
-                    .start_project_thread(request_id, params, project)
+                    .start_thread_with_environment(request_id, params, environment)
                     .await
             }
             Self::InProcess(_) | Self::Remote(_) => Err(IoError::new(
                 std::io::ErrorKind::Unsupported,
-                "Project checkout requires the native cloud transport.",
+                "Selecting an environment requires the native Cloud transport.",
             )),
         };
         decode_typed_response("thread/start", response)
