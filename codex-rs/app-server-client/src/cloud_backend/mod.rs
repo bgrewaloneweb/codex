@@ -10,6 +10,7 @@ mod thread_title;
 
 use crate::AppServerClient;
 use crate::AppServerEvent;
+use crate::CLOUD_RECOVERY_NETWORK_BLOCKED;
 use crate::CloudClient;
 use crate::CloudOperation;
 use crate::cloud::CloudStreamLosses;
@@ -24,6 +25,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -54,6 +57,12 @@ struct PreflightRejection(&'static str);
 #[error("Cloud stream is not connected. Reopen the conversation before sending.")]
 struct MissingReplyAttachment;
 
+/// Local rejection when recovery history no longer belongs to the bound sign-in.
+/// This carries no credentials and never enters the app-server wire envelope.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", idle::SIGN_IN_AGAIN)]
+pub struct CloudRecoverySignInChanged;
+
 struct Attachment {
     thread_id: String,
     stream: ReplyStream,
@@ -63,6 +72,7 @@ struct Attachment {
 struct Replies {
     idle: Option<idle::Recovery>,
     active: Option<Attachment>,
+    attached: Arc<AtomicBool>,
     generation: u64,
     stream_losses: CloudStreamLosses,
     // Keep the last observed status through EOF until this conversation is unloaded.
@@ -70,6 +80,47 @@ struct Replies {
 }
 
 impl Replies {
+    fn set_active(&mut self, active: Option<Attachment>) {
+        self.active = active;
+        self.attached
+            .store(self.active.is_some(), Ordering::Relaxed);
+    }
+
+    async fn next_event(&mut self, output: &mpsc::UnboundedSender<AppServerEvent>) {
+        if let Some(recovery) = &mut self.idle
+            && let Some((root, _, open)) = &mut recovery.held
+        {
+            let opened = open.await;
+            let root = std::mem::take(root);
+            recovery.held = None;
+            if let Some(opened) = opened {
+                if let Err(reason) = recovery.check_permit() {
+                    let _ = opened.ack.send(Err(reason));
+                    return;
+                }
+                let Ok((stream, first)) = check_prepared_stream((opened.stream, opened.first))
+                else {
+                    let _ = opened
+                        .ack
+                        .send(Err("Cloud reply stream disconnected again."));
+                    return;
+                };
+                // Commit through the acknowledgement. If the caller timed out
+                // and closed it first, leave the stream held and drop it here.
+                if opened.ack.send(Ok(())).is_err() {
+                    return;
+                }
+                recovery.attempts += 1;
+                recovery.installed = Some(tokio::time::Instant::now());
+                recovery.observed_idle = None;
+                self.stream_losses.supersede(&root);
+                self.install(&root, stream, first, output);
+            }
+        } else {
+            self.forward_next(output).await;
+        }
+    }
+
     async fn forward_next(&mut self, output: &mpsc::UnboundedSender<AppServerEvent>) {
         if self.active.is_none()
             && let Some(recovery) = &mut self.idle
@@ -116,7 +167,7 @@ impl Replies {
             ended => {
                 let id = active.thread_id.clone();
                 let error = ended.and_then(Result::err);
-                self.active = None;
+                self.set_active(/*active*/ None);
                 if let Some(recovery) = &mut self.idle {
                     recovery
                         .state
@@ -124,6 +175,9 @@ impl Replies {
                     let stable = recovery
                         .installed
                         .is_none_or(|start| start.elapsed() >= std::time::Duration::from_secs(15));
+                    if stable {
+                        recovery.attempts = 0;
+                    }
                     if recovery.observed_idle == Some(true)
                         && stable
                         && idle::transient(error.as_ref())
@@ -161,7 +215,7 @@ impl Replies {
             tokio::select! {
                 biased;
                 result = &mut future => return result,
-                () = self.forward_next(output) => {}
+                () = self.next_event(output) => {}
             }
         }
     }
@@ -214,10 +268,10 @@ impl Replies {
         output: &mpsc::UnboundedSender<AppServerEvent>,
     ) {
         self.generation = self.generation.wrapping_add(1);
-        self.active = Some(Attachment {
+        self.set_active(Some(Attachment {
             thread_id: id.to_owned(),
             stream,
-        });
+        }));
         if let Some(event) = first_event {
             forward(
                 id,
@@ -238,10 +292,11 @@ impl Replies {
 
     fn detach(&mut self, id: &str) {
         if let Some(idle) = &mut self.idle
-            && (idle
-                .pending
-                .as_ref()
-                .is_some_and(|(root, _)| root.as_ref() == id)
+            && (idle.held.as_ref().is_some_and(|(root, _, _)| root == id)
+                || idle
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(root, _)| root.as_ref() == id)
                 || self
                     .active
                     .as_ref()
@@ -257,7 +312,7 @@ impl Replies {
             .as_ref()
             .is_some_and(|active| active.thread_id == id)
         {
-            self.active = None;
+            self.set_active(/*active*/ None);
         }
     }
 
@@ -304,15 +359,10 @@ fn start_worker(
         loaded: None,
         warned_partial_history: None,
     };
+    let handle = app_client.request_handle();
     let mut replies = Replies {
-        idle: Some(idle::Recovery {
-            state: app_client.request_handle().reconnect,
-            pending: None,
-            installed: None,
-            observed_idle: None,
-            client,
-            login: Arc::new(login),
-        }),
+        attached: handle.attached,
+        idle: Some(idle::Recovery::new(handle.reconnect, client, login)),
         stream_losses: app_client.stream_losses.clone(),
         ..Default::default()
     };
@@ -341,7 +391,7 @@ async fn run_worker_with_prepared(
     loop {
         let mut command = tokio::select! {
             _ = output.closed() => return,
-            () = replies.forward_next(output) => continue,
+            () = replies.next_event(output) => continue,
             command = commands.recv() => match command { Some(command) => command, None => return },
             command = async {
                 match &mut prepared {
@@ -440,6 +490,45 @@ async fn run_worker_with_prepared(
                 cloud::SubmissionMode::Steer,
                 None,
             )),
+            CloudOperation::ResumeDisconnectedThread {
+                thread_id,
+                require_history,
+                deadline,
+                release,
+            } => {
+                // Retire canceled holds, but commit a ready handoff through its normal ACK.
+                if replies
+                    .idle
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.held.is_some())
+                {
+                    let _ = replies.next_event(output).now_or_never();
+                }
+                if let Some(recovery) = &mut replies.idle
+                    && let Some(cached) = requests
+                        .loaded
+                        .as_ref()
+                        .filter(|settings| settings.thread.id == thread_id)
+                    && replies.active.is_none()
+                    && recovery.held.is_none()
+                {
+                    // Start a fresh warning epoch before any recovery history is read.
+                    requests.warned_partial_history = None;
+                    recovery.start(
+                        thread_id,
+                        cached.clone(),
+                        require_history,
+                        deadline,
+                        release,
+                        command.response,
+                    );
+                } else {
+                    let _ = command.response.send(Ok(Err(idle::recovery_error(
+                        "This cloud conversation no longer has a reply attachment to restore.",
+                    ))));
+                }
+                continue;
+            }
             CloudOperation::Notify(_) => {
                 Err(eyre!("Cloud client notifications are not supported yet."))
             }
@@ -462,12 +551,18 @@ async fn run_worker_with_prepared(
                         || loaded.is_some_and(|loaded| loaded.thread.id == *id)
                 });
                 // Inventory and history reads have no conversation state to commit.
-                let is_read = matches!(
-                    &request,
-                    protocol::ClientRequest::ThreadList { .. }
-                        | protocol::ClientRequest::ThreadTurnsList { .. }
-                        | protocol::ClientRequest::ThreadItemsList { .. }
-                );
+                let history_thread = match &request {
+                    protocol::ClientRequest::ThreadTurnsList { params, .. } => {
+                        Some(&params.thread_id)
+                    }
+                    protocol::ClientRequest::ThreadItemsList { params, .. } => {
+                        Some(&params.thread_id)
+                    }
+                    _ => None,
+                };
+                let is_read = history_thread.is_some()
+                    || matches!(&request, protocol::ClientRequest::ThreadList { .. });
+                let login = history_thread.and_then(|id| replies.idle.as_ref()?.history_login(id));
                 // When closure and the handshake are both ready, cancel before
                 // the handshake can replace the active attachment.
                 let result = tokio::select! {
@@ -479,7 +574,24 @@ async fn run_worker_with_prepared(
                         }
                         continue;
                     }
-                    result = handle_request(request, mode, environment, requests, replies, output) => result,
+                    result = async {
+                        let read = handle_request(request, mode, environment, requests, replies, output);
+                        let Some((login, deadline)) = login else {
+                            return read.await;
+                        };
+                        tokio::time::timeout_at(deadline, login.permit.run(async {
+                            if !login.current().await {
+                                return Err(eyre!(CloudRecoverySignInChanged));
+                            }
+                            let result = read.await;
+                            if !login.current().await {
+                                return Err(eyre!(CloudRecoverySignInChanged));
+                            }
+                            login.permit.check().map_err(|_| eyre!(CLOUD_RECOVERY_NETWORK_BLOCKED))?;
+                            result
+                        })).await.map_err(|_| eyre!(idle::RECOVERY_TIMEOUT))?
+                            .map_err(|_| eyre!(CLOUD_RECOVERY_NETWORK_BLOCKED))?
+                    } => result,
                 };
                 if unloads
                     && result.is_ok()
@@ -499,7 +611,13 @@ async fn run_worker_with_prepared(
         {
             replies.report_loss(&root, /*reason*/ None, output);
         }
-        let _ = command.response.send(Ok(request_result(result)));
+        let response = match result {
+            Err(error) if error.is::<CloudRecoverySignInChanged>() => {
+                Err(std::io::Error::other(CloudRecoverySignInChanged))
+            }
+            result => Ok(request_result(result)),
+        };
+        let _ = command.response.send(response);
     }
 }
 
@@ -806,6 +924,15 @@ fn forward(
                 recovery.observe_busy();
             }
         }
+        if let Ok(status) = serde_json::from_value(serde_json::json!(&status)) {
+            let change = protocol::ThreadStatusChangedNotification {
+                thread_id: id.to_owned(),
+                status,
+            };
+            let _ = output.send(AppServerEvent::CloudInventoryChanged(Some(Box::new(
+                protocol::ServerNotification::ThreadStatusChanged(change),
+            ))));
+        }
         *latest_status = Some((id.to_owned(), status));
         return;
     }
@@ -833,7 +960,24 @@ fn forward(
             thread_id: Some(id.to_owned()),
             message: "This cloud turn requested an unsupported interaction. Open it in another client to continue.".into(),
         }),
-        cloud::Event::Notification(_) => return,
+        event @ cloud::Event::Notification(_) => {
+            let lifecycle = match event.inventory_change() {
+                Some(cloud::InventoryChange::Archived(thread_id)) => Some(
+                    protocol::ServerNotification::ThreadArchived(
+                        protocol::ThreadArchivedNotification { thread_id },
+                    ),
+                ),
+                Some(cloud::InventoryChange::Unarchived(thread_id)) => Some(
+                    protocol::ServerNotification::ThreadUnarchived(
+                        protocol::ThreadUnarchivedNotification { thread_id },
+                    ),
+                ),
+                Some(cloud::InventoryChange::Refresh) => None,
+                None => return,
+            };
+            let _ = output.send(AppServerEvent::CloudInventoryChanged(lifecycle.map(Box::new)));
+            return;
+        }
     };
     send_notification(output, notification);
 }

@@ -15,6 +15,7 @@ mod loading;
 #[path = "agents_overview_selection.rs"]
 mod selection;
 
+use super::agents_overview_discovery::AgentsOverviewDiscovery;
 use super::agents_overview_discovery::is_overview_root;
 use super::agents_overview_discovery::is_visible_in_agents_overview;
 use super::agents_overview_view::AgentsOverviewGroup;
@@ -26,7 +27,9 @@ use super::*;
 use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::backend_id::BackendId;
 use crate::bottom_pane::BottomPaneView;
+use crate::chatwidget::ReadOnlyThread;
 use crate::chatwidget::ThreadInputStateRestoreMode;
+use crate::session_start::is_archived_session_error;
 use crate::startup_draft::StartupDraftPump;
 use codex_app_server_protocol::SessionSource;
 use codex_app_server_protocol::Thread;
@@ -57,10 +60,12 @@ pub(super) struct AgentsOverviewState {
     pub(super) usage_disabled: bool,
     pub(super) activity: HashMap<ThreadId, super::agents_overview_details::AgentsOverviewActivity>,
     pub(super) initialized: HashSet<BackendId>,
-    pub(super) discovery:
-        HashMap<BackendId, super::agents_overview_discovery::AgentsOverviewDiscovery>,
+    pub(super) discovery: HashMap<BackendId, AgentsOverviewDiscovery>,
     pub(super) show_more_backends: HashSet<BackendId>,
     pub(super) refresh_show_more: bool,
+    pub(super) refresh_recent_backends: HashSet<BackendId>,
+    pub(super) cloud_inventory_dirty: HashSet<BackendId>,
+    pub(super) active_refresh_recent: bool,
     pub(super) refresh_failed_backends: HashSet<BackendId>,
     /// Vacancies left by lifecycle removals, tracked by the backend that owned the row.
     pub(super) refill_by_backend: HashMap<BackendId, usize>,
@@ -72,7 +77,7 @@ pub(super) struct AgentsOverviewState {
     pub(super) active_refresh_thread_ids: HashSet<ThreadId>,
     pub(super) pins_by_backend: std::collections::BTreeMap<BackendId, Option<Vec<ThreadId>>>,
     pub(super) pending_pin_change: Option<(Uuid, BackendId)>,
-    pub(super) refresh_task: Option<tokio::task::AbortHandle>,
+    pub(super) refresh_task: Option<tokio::task::JoinHandle<()>>,
     pub(super) refresh_notifications: HashMap<ThreadId, Vec<ServerNotification>>,
     pub(super) rendered_full_screen: bool,
     pub(super) visible_thread_ids: Vec<ThreadId>,
@@ -95,6 +100,14 @@ pub(super) struct AgentsOverviewState {
 }
 
 impl AgentsOverviewState {
+    pub(super) fn cloud_refresh_pending(&self, owner: BackendId) -> bool {
+        (self.active_refresh_recent && self.active_refresh.is_some_and(|(_, id)| id == owner))
+            || self
+                .discovery
+                .get(&owner)
+                .is_some_and(AgentsOverviewDiscovery::has_cloud_refresh_pending)
+    }
+
     pub(super) fn refill_count(&self, owner: BackendId) -> usize {
         self.refill_by_backend
             .get(&owner)
@@ -111,7 +124,7 @@ impl AgentsOverviewState {
             && self
                 .discovery
                 .get(&owner)
-                .is_some_and(super::agents_overview_discovery::AgentsOverviewDiscovery::has_more)
+                .is_some_and(AgentsOverviewDiscovery::has_more)
     }
 }
 
@@ -150,6 +163,17 @@ impl App {
                 "Reconnecting — agent list is stale"
             });
         }
+        if app_server.thread_params_mode() == crate::app_server_session::ThreadParamsMode::Cloud {
+            let owner = app_server.backend_id();
+            if self.agents_overview.cloud_refresh_pending(owner) {
+                self.cancel_agents_overview_refresh(owner);
+            }
+            if let Some(discovery) = self.agents_overview.discovery.get_mut(&owner) {
+                discovery.restart_cloud_refresh();
+            }
+            self.agents_overview.cloud_inventory_dirty.remove(&owner);
+            self.agents_overview.refresh_recent_backends.insert(owner);
+        }
         self.refresh_agents_overview_threads(app_server);
     }
 
@@ -172,6 +196,7 @@ impl App {
         let refill_succeeded = result
             .as_ref()
             .is_ok_and(|refresh| refresh.recent_seed_complete);
+        self.agents_overview.active_refresh_recent = false;
         if !refill_succeeded {
             self.agents_overview
                 .refresh_failed_backends
@@ -218,7 +243,18 @@ impl App {
                 if refresh.recent_seed_complete {
                     self.agents_overview.initialized.insert(refresh_backend_id);
                 }
-                if let Some(discovery) = refresh.discovery {
+                if let Some(mut discovery) = refresh.discovery {
+                    // Fresh Cloud list rows can recover from a missed unarchive.
+                    let overview = &mut self.agents_overview;
+                    for id in discovery.fresh_cloud_page_ids.drain(..) {
+                        if refill_succeeded
+                            && self.backend_registry.owner(id) == Some(refresh_backend_id)
+                            && !overview.pending_archives.contains_key(&id)
+                            && !overview.refresh_notifications.contains_key(&id)
+                        {
+                            overview.removed_threads.remove(&id);
+                        }
+                    }
                     if !discovery.has_more() {
                         self.agents_overview
                             .refill_by_backend
@@ -371,6 +407,7 @@ impl App {
         let overview = &mut self.agents_overview;
         overview.initialized.remove(&backend_id);
         overview.discovery.remove(&backend_id);
+        overview.cloud_inventory_dirty.remove(&backend_id);
         overview
             .removed_threads
             .retain(|thread_id| self.backend_registry.owner(*thread_id) != Some(backend_id));
@@ -383,19 +420,27 @@ impl App {
             .is_some_and(|owner| overview.has_more_for(&self.backend_registry, owner));
     }
 
-    pub(super) fn cancel_agents_overview_refresh(&mut self, backend_id: BackendId) {
+    pub(super) fn cancel_agents_overview_refresh(
+        &mut self,
+        backend_id: BackendId,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let overview = &mut self.agents_overview;
+        let mut canceled = None;
         if overview
             .active_refresh
             .is_some_and(|(_, owner)| owner == backend_id)
         {
-            if let Some(task) = overview.refresh_task.take() {
+            canceled = overview.refresh_task.take();
+            if let Some(task) = &canceled {
                 task.abort();
             }
             overview.active_refresh = None;
             overview.refresh_notifications.clear();
             if std::mem::take(&mut overview.refresh_show_more) {
                 overview.show_more_backends.insert(backend_id);
+            }
+            if std::mem::take(&mut overview.active_refresh_recent) {
+                overview.refresh_recent_backends.insert(backend_id);
             }
             let removed_threads = &overview.removed_threads;
             overview.refresh_thread_ids.extend(
@@ -414,6 +459,8 @@ impl App {
             .pending_refresh_backends
             .retain(|id| *id != backend_id);
         if self.backend_registry.request_handle(backend_id).is_none() {
+            overview.refresh_recent_backends.remove(&backend_id);
+            overview.cloud_inventory_dirty.remove(&backend_id);
             overview.refresh_failed_backends.remove(&backend_id);
         }
         self.drain_agents_overview_refresh_queue();
@@ -434,6 +481,7 @@ impl App {
             });
         }
         self.repaint_agents_overview();
+        canceled
     }
 
     pub(super) fn repaint_agents_overview(&mut self) {
@@ -711,6 +759,7 @@ impl App {
         if self.current_displayed_thread_id() == Some(root_thread_id)
             && (!self.thread_unavailable(root_thread_id) || self.chat_widget.is_read_only_view())
         {
+            self.cancel_cloud_inventory_refresh(app_server).await;
             // Keep the displayed read-only snapshot frozen; R explicitly retries attachment.
             if let Ok(mut state) = self.agents_overview.view_state.lock() {
                 state.completion = Some(crate::bottom_pane::ViewCompletion::Accepted);
@@ -926,13 +975,13 @@ impl App {
                 ThreadAttachPresentation::SessionLineage
             };
             let (resumed, read_only) = if let Some((_, started)) = started {
-                (started, false)
+                (started, None)
             } else if let Some(blank) = self
                 .live_blank_session(app_server, root_thread_id, &target_thread)
                 .await
             {
                 restored_blank_session = true;
-                (blank, false)
+                (blank, None)
             } else {
                 match app_server
                     .resume_thread_with_permission_overrides(
@@ -947,15 +996,21 @@ impl App {
                     Ok(resumed) => {
                         provider_resume_checked = true;
                         resumed_mode = Some(resumed.session.collaboration_mode.is_some());
-                        (resumed, false)
+                        (resumed, None)
                     }
                     Err(error)
                         if crate::app_server_session::is_active_writer_error(&error)
                             || crate::app_server_session::model_provider_error(&error)
-                                .is_some() =>
+                                .is_some()
+                            || is_archived_session_error(&error, root_thread_id) =>
                     {
                         provider_resume_checked = true;
                         provider_error = crate::app_server_session::model_provider_error(&error);
+                        let reason = if is_archived_session_error(&error, root_thread_id) {
+                            ReadOnlyThread::Archived
+                        } else {
+                            ReadOnlyThread::ExternalWriter
+                        };
                         match app_server
                             .read_thread_for_viewing(
                                 &resume_config,
@@ -966,7 +1021,7 @@ impl App {
                         {
                             Ok((thread, notice)) => {
                                 history_notice = notice;
-                                (thread, true)
+                                (thread, Some(reason))
                             }
                             Err(_) => {
                                 tracing::warn!("Failed to load read-only conversation history");
@@ -1026,7 +1081,8 @@ impl App {
                 }
             }
             // Read-only views retain explicit choices but never another task's restored state.
-            let preserve_explicit_permissions = preserve_explicit_permissions || read_only;
+            let preserve_explicit_permissions =
+                preserve_explicit_permissions || read_only.is_some();
             self.runtime_approvals_reviewer_override = self
                 .runtime_approvals_reviewer_override
                 .filter(|_| preserve_explicit_permissions);
@@ -1074,10 +1130,16 @@ impl App {
             if let Some(error) = provider_error {
                 self.chat_widget
                     .show_provider_error(error, /*rejected_message_id*/ None);
-            } else if read_only {
-                self.ensure_thread_channel(root_thread_id)
-                    .mark_external_writer();
-                self.chat_widget.show_external_writer_thread();
+            } else if let Some(reason) = read_only {
+                let channel = self.ensure_thread_channel(root_thread_id);
+                match reason {
+                    ReadOnlyThread::Archived => {
+                        channel.archived = true;
+                        channel.mark_replay_only();
+                    }
+                    ReadOnlyThread::ExternalWriter => channel.mark_external_writer(),
+                }
+                self.chat_widget.show_read_only_thread(reason);
             }
             if let Some(notice) = history_notice {
                 self.chat_widget
@@ -1097,7 +1159,7 @@ impl App {
             if is_new_session {
                 self.remember_launch_permissions();
             }
-            if !read_only {
+            if read_only.is_none() {
                 let approval = self.config.permissions.approval_policy.value();
                 if self
                     .runtime_approval_policy_override
@@ -1234,7 +1296,7 @@ impl App {
         &mut self,
         tui: &mut tui::Tui,
         app_server: &mut AppServerSession,
-        cwd: Option<AbsolutePathBuf>,
+        cwd: Option<PathBuf>,
         mut startup_draft: Option<&mut StartupDraftPump>,
     ) -> Option<(Config, Option<PathBuf>)> {
         if self
@@ -1247,17 +1309,12 @@ impl App {
             );
             return None;
         }
-        let remote = app_server.uses_remote_workspace();
-        let remote_cwd = cwd
-            .as_ref()
-            .filter(|_| remote)
-            .map(AbsolutePathBuf::to_path_buf);
-        let local_cwd = if remote {
-            self.config.cwd.to_path_buf()
+        let (local_cwd, remote_cwd) = if app_server.uses_remote_workspace() {
+            (self.config.cwd.to_path_buf(), cwd)
         } else {
-            cwd.map_or_else(
-                || self.chat_widget.config_ref().cwd.to_path_buf(),
-                |cwd| cwd.to_path_buf(),
+            (
+                cwd.unwrap_or_else(|| self.chat_widget.session_cwd().to_path_buf()),
+                None,
             )
         };
         let mut config = match StartupDraftPump::run_with_optional_draft(
