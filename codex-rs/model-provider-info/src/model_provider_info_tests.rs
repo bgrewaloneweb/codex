@@ -205,7 +205,22 @@ wire_api = "chat"
         "#;
 
     let err = toml::from_str::<ModelProviderInfo>(provider_toml).unwrap_err();
-    assert!(err.to_string().contains(CHAT_WIRE_API_REMOVED_ERROR));
+    assert!(
+        err.to_string()
+            .contains("`wire_api = \"chat\"` is no longer supported")
+    );
+}
+
+#[test]
+fn test_deserialize_converse_wire_api() {
+    let provider: ModelProviderInfo = toml::from_str(
+        r#"
+name = "Bedrock"
+wire_api = "converse"
+"#,
+    )
+    .unwrap();
+    assert_eq!(provider.wire_api, WireApi::Converse);
 }
 
 #[test]

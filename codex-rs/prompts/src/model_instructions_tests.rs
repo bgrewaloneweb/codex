@@ -10,6 +10,7 @@ use pretty_assertions::assert_eq;
 fn test_model(model_messages: Option<ModelMessages>) -> ModelInfo {
     ModelInfo {
         slug: "test-model".to_string(),
+        wire_api: None,
         display_name: "Test Model".to_string(),
         description: None,
         default_reasoning_level: None,

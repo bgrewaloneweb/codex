@@ -288,7 +288,6 @@ default-members = [
     "runtime-agent-instance",
     "response-debug-context",
     "sandboxing",
-    "stdio-to-uds",
     "otel",
     "otel-trace-websocket",
     "tcp-tunnel",

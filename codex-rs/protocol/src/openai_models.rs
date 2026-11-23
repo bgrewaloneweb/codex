@@ -416,6 +416,48 @@ const fn is_true(value: &bool) -> bool {
     *value
 }
 
+const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+
+/// Wire protocol that the provider speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, JsonSchema, TS)]
+#[serde(rename_all = "lowercase")]
+pub enum WireApi {
+    /// The Responses API exposed by OpenAI at `/v1/responses`.
+    #[default]
+    Responses,
+
+    /// The Amazon Bedrock Converse API.
+    Converse,
+}
+
+impl fmt::Display for WireApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::Responses => "responses",
+            Self::Converse => "converse",
+        };
+        f.write_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireApi {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "responses" => Ok(Self::Responses),
+            "converse" => Ok(Self::Converse),
+            "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "converse"],
+            )),
+        }
+    }
+}
+
 /// Model metadata returned by the Codex backend `/models` endpoint.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelInfo {
@@ -425,6 +467,9 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardian: Option<GuardianModelPolicy>,
     pub slug: String,
+    /// Model-specific protocol override; absent uses the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<WireApi>,
     pub display_name: String,
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1204,6 +1249,7 @@ mod tests {
     pub(super) fn test_model(spec: Option<ModelMessages>) -> ModelInfo {
         ModelInfo {
             slug: "test-model".to_string(),
+            wire_api: None,
             display_name: "Test Model".to_string(),
             description: None,
             default_reasoning_level: None,
@@ -1251,6 +1297,21 @@ mod tests {
             multi_agent_reasoning_effort: None,
             multi_agent_tools_in_code_mode: None,
         }
+    }
+
+    #[test]
+    fn model_wire_api_is_optional_and_round_trips() {
+        let mut model = test_model(None);
+        let without_override = serde_json::to_value(&model).expect("serialize model");
+        assert!(without_override.get("wire_api").is_none());
+        let decoded: ModelInfo = serde_json::from_value(without_override).expect("decode model");
+        assert_eq!(decoded.wire_api, None);
+
+        model.wire_api = Some(WireApi::Converse);
+        let with_override = serde_json::to_value(&model).expect("serialize model");
+        assert_eq!(with_override["wire_api"], "converse");
+        let decoded: ModelInfo = serde_json::from_value(with_override).expect("decode model");
+        assert_eq!(decoded.wire_api, Some(WireApi::Converse));
     }
     #[test]
     fn model_messages_deserialize_without_optional_sections() {

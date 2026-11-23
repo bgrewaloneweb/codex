@@ -2861,8 +2861,13 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<OpenedModelResponse> {
-        let wire_api = self.client.state.provider.info().wire_api;
+        let wire_api = model_info
+            .wire_api
+            .unwrap_or(self.client.state.provider.info().wire_api);
         match wire_api {
+            WireApi::Converse => Err(CodexErr::UnsupportedOperation(
+                "Bedrock Converse is not implemented yet".to_string(),
+            )),
             WireApi::Responses => {
                 if self.client.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();

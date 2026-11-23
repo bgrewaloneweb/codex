@@ -1,3 +1,4 @@
+use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::protocol::MultiAgentVersion;
 use pretty_assertions::assert_eq;
 
@@ -53,6 +54,12 @@ fn runtime_catalog_includes_supported_cross_region_models_in_priority_order() {
                 "us.openai.gpt-5.6-luna",
                 "GPT-5.6 Luna (US cross-region)",
                 19
+            ),
+            ("global.xai.grok-4.7", "Grok 4.7 (Global)", 20,),
+            (
+                "eu.anthropic.claude-sonnet-5-5",
+                "Claude Sonnet 5.5 (EU)",
+                21
             ),
         ]
     );
@@ -194,6 +201,35 @@ fn runtime_catalog_disables_web_search_without_overriding_review_models() {
                 false,
                 Some(MultiAgentVersion::V1),
             ),
+            ("global.xai.grok-4.7", None, false, None,),
+            ("eu.anthropic.claude-sonnet-5-5", None, false, None),
         ]
+    );
+}
+
+#[test]
+fn runtime_catalog_includes_grok_4_7() {
+    let catalog = static_runtime_model_catalog();
+
+    let grok = catalog
+        .models
+        .iter()
+        .find(|model| model.slug == "global.xai.grok-4.7")
+        .expect("Grok 4.7 should appear in the runtime catalog");
+
+    assert_eq!(grok.display_name, "Grok 4.7 (Global)");
+    assert_eq!(grok.context_window, Some(524_288));
+    assert!(!grok.supports_search_tool);
+    assert_eq!(grok.visibility, ModelVisibility::List);
+    assert_eq!(grok.supported_reasoning_levels.len(), 4);
+    assert_eq!(
+        super::bundled_model("grok-4.7").visibility,
+        ModelVisibility::Hide
+    );
+    assert!(
+        super::static_model_catalog()
+            .models
+            .iter()
+            .all(|model| !model.slug.contains("grok"))
     );
 }
