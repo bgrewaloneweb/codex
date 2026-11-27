@@ -233,3 +233,19 @@ fn runtime_catalog_includes_grok_4_7() {
             .all(|model| !model.slug.contains("grok"))
     );
 }
+
+#[test]
+fn claude_sonnet_uses_converse() {
+    let catalog = static_runtime_model_catalog();
+
+    let sonnet: &codex_protocol::openai_models::ModelInfo = catalog
+        .models
+        .iter()
+        .find(|model| model.slug == "eu.anthropic.claude-sonnet-5-5")
+        .expect("Claude Sonnet should appear in the runtime catalog");
+
+    assert_eq!(
+        sonnet.wire_api,
+        Some(codex_protocol::openai_models::WireApi::Converse)
+    );
+}

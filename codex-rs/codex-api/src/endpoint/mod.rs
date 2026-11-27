@@ -1,3 +1,4 @@
+pub(crate) mod converse;
 pub(crate) mod images;
 pub(crate) mod memories;
 pub(crate) mod models;
